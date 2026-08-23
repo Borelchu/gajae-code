@@ -9,6 +9,7 @@ import type { Args } from "@gajae-code/coding-agent/cli/args";
 import { buildDefaultTmuxLaunchPlan } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import {
 	ensureLaunchWorktree,
+	nodeModulesLinksInto,
 	parseLaunchWorktreeMode,
 	planLaunchWorktree,
 	prepareLaunchWorktree,
@@ -33,6 +34,13 @@ function testSlug(value: string): string {
 	const prefix = readable || "default";
 	const digest = crypto.createHash("sha256").update(value).digest("hex").slice(0, 8);
 	return `${prefix}-${digest}`;
+}
+
+/** Asserts the exact directory-entry state at `entryPath`: "missing" | "dir" | "symlink". */
+async function expectEntryState(entryPath: string, expected: "missing" | "dir" | "symlink"): Promise<void> {
+	const stat = await fs.lstat(entryPath).catch(() => null);
+	const actual = stat === null ? "missing" : stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "dir" : "other";
+	expect(actual).toBe(expected);
 }
 
 /** Runs `body` with the bucket override applied, restoring the caller's environment. */
@@ -465,6 +473,1901 @@ describe("default launch worktrees", () => {
 		expect(plan?.cwd).toBe(launch.cwd);
 		expect(plan?.newSessionArgs).toContain(launch.cwd);
 	});
+});
+describe("launch worktree node_modules isolation (#4620)", () => {
+	async function createWorkspaceRepo(prefix: string): Promise<string> {
+		const repo = await createRepo(prefix);
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+		return repo;
+	}
+
+	it("keeps workspace boundaries inside a supported symlinked bucket", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-workspace-bucket-alias-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const target = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-workspace-bucket-target-"));
+		cleanupPaths.push(target);
+		await fs.symlink(target, bucket, process.platform === "win32" ? "junction" : "dir");
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "workspace-alias"]);
+		expect(await fs.realpath(launched.cwd)).toBe(await fs.realpath(path.join(target, testSlug("workspace-alias"))));
+		expect(await fs.realpath(path.join(launched.cwd, "node_modules", "@scope", "app"))).toBe(
+			path.join(await fs.realpath(launched.cwd), "packages", "app"),
+		);
+	});
+
+	it("does not share node_modules when workspace self-links resolve into the source repo", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-workspace-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "@scope"), { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(originModules, "@scope", "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// No shared symlink: what exists (if anything) is a worktree-local
+		// boundary, never a link to the origin checkout's tree.
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
+		expect(await fs.realpath(worktreeModules)).toBe(worktreeModules);
+		// The worktree-local boundary resolves the worktree's own workspace source.
+		const boundaryLink = path.join(worktreeModules, "@scope", "app");
+		expect((await fs.lstat(boundaryLink)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(boundaryLink)).toBe(path.join(launched.cwd, "packages", "app"));
+		// The origin checkout's install stays untouched.
+		expect((await fs.lstat(path.join(originModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("still shares node_modules when links resolve outside the source repo", async () => {
+		const repo = await createRepo("gjc-launch-worktree-external-links-");
+		const originModules = path.join(repo, "node_modules");
+		const external = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-store-"));
+		cleanupPaths.push(external);
+		await fs.mkdir(path.join(originModules, ".store"), { recursive: true });
+		await fs.symlink(path.join(external, "pkg"), path.join(originModules, ".store", "pkg"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(worktreeModules)).toBe(await fs.realpath(originModules));
+	});
+
+	it("shares node_modules for a plain repo whose .bin shims resolve inside the tree", async () => {
+		// `node_modules/.bin/<tool> -> ../<pkg>/bin/<tool>.js` realpaths under the
+		// source root, but stays inside node_modules: it describes the install
+		// graph, not the repository's sources. Treating it as a workspace self-link
+		// refused the share for ordinary non-workspace repos, leaving the worktree
+		// with no node_modules at all.
+		const repo = await createRepo("gjc-launch-worktree-bin-shim-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "leftpad", "bin"), { recursive: true });
+		await Bun.write(path.join(originModules, "leftpad", "bin", "leftpad.js"), "module.exports = 1;\n");
+		await fs.mkdir(path.join(originModules, ".bin"), { recursive: true });
+		await fs.symlink(path.join("..", "leftpad", "bin", "leftpad.js"), path.join(originModules, ".bin", "leftpad"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(worktreeModules)).toBe(await fs.realpath(originModules));
+		// The shared tree actually resolves the dependency from the worktree.
+		expect(await fs.realpath(path.join(worktreeModules, "leftpad", "bin", "leftpad.js"))).toBe(
+			await fs.realpath(path.join(originModules, "leftpad", "bin", "leftpad.js")),
+		);
+	});
+
+	it("fails closed when an internal scan symlink is retargeted before traversal", async () => {
+		const repo = await createRepo("gjc-launch-worktree-scan-retarget-");
+		const originModules = path.join(repo, "node_modules");
+		const internalTarget = path.join(originModules, "internal-store");
+		const alias = path.join(originModules, "alias");
+		const external = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-scan-retarget-external-"));
+		cleanupPaths.push(external);
+		await fs.mkdir(internalTarget, { recursive: true });
+		await fs.mkdir(external, { recursive: true });
+		await fs.symlink(internalTarget, alias, "dir");
+
+		const realStat = fsSync.statSync.bind(fsSync);
+		let retargeted = false;
+		const statSpy = spyOn(fsSync, "statSync").mockImplementation(((target: fsSync.PathLike, options?: unknown) => {
+			if (path.resolve(String(target)) === path.resolve(alias) && !retargeted) {
+				retargeted = true;
+				fsSync.rmSync(alias, { force: true, recursive: true });
+				fsSync.symlinkSync(external, alias, "dir");
+			}
+			return realStat(target, options as never);
+		}) as unknown as typeof fsSync.statSync);
+		try {
+			expect(nodeModulesLinksInto(originModules, repo)).toBe(true);
+			expect(retargeted).toBe(true);
+		} finally {
+			statSpy.mockRestore();
+		}
+	});
+
+	it("fails closed when an internal scan symlink is replaced after identity validation", async () => {
+		const repo = await createRepo("gjc-launch-worktree-scan-same-path-");
+		const originModules = path.join(repo, "node_modules");
+		const internalTarget = path.join(originModules, "internal-store");
+		const alias = path.join(originModules, "alias");
+		const external = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-scan-same-path-external-"));
+		cleanupPaths.push(external);
+		await fs.mkdir(internalTarget, { recursive: true });
+		await fs.mkdir(external, { recursive: true });
+		await fs.symlink(internalTarget, alias, "dir");
+
+		const realRealpath = fsSync.realpathSync;
+		let aliasReads = 0;
+		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementation(((target: fsSync.PathLike) => {
+			if (path.resolve(String(target)) === path.resolve(alias)) {
+				aliasReads += 1;
+				if (aliasReads === 2) {
+					fsSync.rmSync(alias, { force: true, recursive: true });
+					fsSync.symlinkSync(external, alias, "dir");
+				}
+			}
+			return realRealpath(target as string);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			expect(nodeModulesLinksInto(originModules, repo)).toBe(true);
+			expect(aliasReads).toBeGreaterThanOrEqual(2);
+			expect(await fs.realpath(alias)).toBe(external);
+		} finally {
+			realpathSpy.mockRestore();
+		}
+	});
+
+	it("does not share when a link nested deep inside node_modules escapes to source packages", async () => {
+		// The .bin exclusion is scoped to targets that stay inside node_modules.
+		// An isolated-layout link buried several levels down that still reaches
+		// `packages/<pkg>` couples the checkouts and must refuse the share.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-deep-escape-");
+		const originModules = path.join(repo, "node_modules");
+		const nested = path.join(originModules, ".bun", "install", "cache");
+		await fs.mkdir(nested, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(nested, "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
+		expect(await fs.realpath(worktreeModules)).toBe(worktreeModules);
+	});
+
+	it("remediates an already-contaminated worktree node_modules symlink", async () => {
+		const repo = await createRepo("gjc-launch-worktree-remediate-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(originModules);
+
+		const contaminated = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect((await fs.lstat(path.join(contaminated.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+
+		// A self-link appearing in the origin tree after the first launch makes
+		// the share unsafe: reuse must remove the launcher's own link and
+		// isolate instead of re-sharing.
+		await fs.mkdir(path.join(originModules, "@scope"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(originModules, "@scope", "app"));
+
+		const remediated = prepareLaunchWorktree(repo, ["--worktree"]);
+		await expectEntryState(path.join(remediated.cwd, "node_modules"), "missing");
+		// The origin's own node_modules survives remediation.
+		expect((await fs.stat(originModules)).isDirectory()).toBe(true);
+	});
+
+	it("preserves the proven-safe source dependency tree for plain repositories across reuse", async () => {
+		const repo = await createRepo("gjc-launch-worktree-preserve-plain-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(originModules);
+
+		const first = prepareLaunchWorktree(repo, ["--worktree", "preserve-plain"]);
+		const firstLink = path.join(first.cwd, "node_modules");
+		expect((await fs.lstat(firstLink)).isSymbolicLink()).toBe(true);
+
+		// A plain repository whose source tree has no self-links keeps its
+		// shared dependency tree on reuse: removal would strand every import.
+		const second = prepareLaunchWorktree(repo, ["--worktree", "preserve-plain"]);
+		expect((await fs.lstat(path.join(second.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(path.join(second.cwd, "node_modules"))).toBe(originModules);
+	});
+
+	it("leaves a real worktree node_modules directory untouched", async () => {
+		const repo = await createRepo("gjc-launch-worktree-owned-modules-");
+		// No origin node_modules: the worktree never gets a symlink, so the
+		// directory below stays genuinely worktree-owned.
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "owned-modules"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await Bun.file(worktreeModules).exists()).toBe(false);
+		await fs.mkdir(worktreeModules, { recursive: true });
+		await Bun.write(path.join(worktreeModules, "marker.txt"), "user-owned\n");
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "owned-modules"]);
+		expect(await Bun.file(path.join(reused.cwd, "node_modules", "marker.txt")).text()).toBe("user-owned\n");
+	});
+
+	it("never creates a node_modules symlink when the source repo has none", async () => {
+		const repo = await createRepo("gjc-launch-worktree-no-modules-");
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
+	});
+
+	it("detects bun isolated-linker workspace layouts under node_modules/.bun", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-isolated-store-");
+		const originModules = path.join(repo, "node_modules");
+		const storeModules = path.join(originModules, ".bun", "node_modules", "@scope");
+		await fs.mkdir(storeModules, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(storeModules, "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "dir");
+	});
+	it("detects pnpm scoped workspace layouts at deeper nesting (.pnpm depth 5)", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-pnpm-store-");
+		const originModules = path.join(repo, "node_modules");
+		const storeModules = path.join(originModules, ".pnpm", "@scope+app@1.0.0", "node_modules", "@scope");
+		await fs.mkdir(storeModules, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(storeModules, "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "dir");
+	});
+
+	it("detects the origin node_modules root itself linking into the source repo", async () => {
+		const repo = await createRepo("gjc-launch-worktree-rootlink-");
+		// A vendored node_modules directory inside the repo, with the root
+		// node_modules symlink pointing at it.
+		const vendored = path.join(repo, ".vendor", "node_modules");
+		await fs.mkdir(vendored, { recursive: true });
+		await fs.symlink(vendored, path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		// Plain repo (no declaration): nothing is shared and no boundary exists.
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
+	});
+
+	it("does not throw when the worktree carries a dangling node_modules symlink", async () => {
+		const repo = await createRepo("gjc-launch-worktree-dangling-modules-");
+		await fs.mkdir(path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "dangling-modules"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// The launch already created a shared symlink (plain-repo origin); replace
+		// it with a dangling one the way a stale cross-checkout link would look.
+		await fs.rm(worktreeModules);
+		await fs.symlink(path.join(launched.cwd, "does-not-exist"), worktreeModules, "dir");
+
+		// A dangling link's ownership can never be proven, so the launch refuses
+		// instead of deleting it or continuing through it; the link is preserved
+		// for the user.
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "dangling-modules"])).toThrow(
+			/worktree_node_modules_unverified/,
+		);
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+	});
+
+	it("never shares an origin node_modules symlinked outside the repo (parent workspace hoist)", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-parent-hoist-"));
+		cleanupPaths.push(parent);
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(repo);
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		await Bun.write(path.join(repo, "README.md"), "hello\n");
+		run("git", ["add", "README.md"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// Parent workspace hoists its own packages into parent/node_modules.
+		await fs.mkdir(path.join(parent, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(parent, "node_modules", "@scope"), { recursive: true });
+		await fs.symlink(path.join(parent, "packages", "app"), path.join(parent, "node_modules", "@scope", "app"));
+		// The nested repo borrows the parent's tree.
+		await fs.symlink(path.join(parent, "node_modules"), path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await Bun.file(worktreeModules).exists()).toBe(false);
+	});
+
+	it("fails closed when the scan cannot read a traversal directory", async () => {
+		// A plain repo (no workspace declaration): sharing is decided by the
+		// origin-tree scan, which is exactly the path this fault exercises.
+		const repo = await createRepo("gjc-launch-worktree-unreadable-scan-");
+		// The origin tree carries a resolvable workspace-style self-link; the repo
+		// itself declares no workspaces, so sharing is decided by the scan.
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		const originModules = path.join(repo, "node_modules");
+		// A self-link that the fault-injected scan cannot see past.
+		const scoped = path.join(originModules, "@scope");
+		await fs.mkdir(scoped, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(scoped, "app"));
+
+		// Fault-inject EACCES deterministically at the scoped directory only.
+		// chmod is unreliable under root, and an untargeted first-call spy would
+		// be consumed by the scan's read of the node_modules root before ever
+		// reaching the traversal directory the fail-closed branch guards.
+		const realReaddir = fsSync.readdirSync.bind(fsSync) as unknown as (...args: unknown[]) => unknown;
+		let reachedScopedDir = false;
+		const readdirSpy = spyOn(fsSync, "readdirSync").mockImplementation(((
+			dir: fsSync.PathLike,
+			options?: fsSync.ObjectEncodingOptions & { withFileTypes?: boolean; recursive?: boolean },
+		) => {
+			if (path.resolve(String(dir)) === scoped) {
+				reachedScopedDir = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realReaddir(dir, options);
+		}) as unknown as typeof fsSync.readdirSync);
+		try {
+			const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+			expect(reachedScopedDir).toBe(true);
+			// The scan failed closed: the origin tree is never shared (a plain
+			// repo without a declaration gets no boundary directory at all).
+			await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
+		} finally {
+			readdirSpy.mockRestore();
+		}
+	});
+
+	it("refuses the launch for a stale link whose identity cannot be proven (EACCES)", async () => {
+		const repo = await createRepo("gjc-launch-worktree-hoist-eacces-");
+		await fs.mkdir(path.join(repo, "node_modules"));
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+
+		// Target the identity-resolution branch specifically: the outer
+		// sourceRoot realpath must still succeed, and only the worktree link's
+		// resolution fails. Identity is then unprovable — the launcher must
+		// refuse the launch rather than delete the link or continue through it.
+		const realRealpath = fsSync.realpathSync.bind(fsSync);
+		let reachedLinkResolution = false;
+		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementation(((pathArg: fsSync.PathLike) => {
+			if (path.resolve(String(pathArg)) === path.resolve(worktreeModules)) {
+				reachedLinkResolution = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realRealpath(pathArg);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"])).toThrow(
+				/worktree_node_modules_unverified/,
+			);
+			expect(reachedLinkResolution).toBe(true);
+			// The unproven link is preserved for the user to inspect.
+			expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+		} finally {
+			realpathSpy.mockRestore();
+		}
+	});
+
+	it("remediates a stale worktree link to a parent-workspace hoist (identity match)", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-stale-hoist-"));
+		cleanupPaths.push(parent);
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }),
+		);
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			'{"name":"@scope/app","exports":{".":"./src/index.ts"}}\n',
+		);
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// Parent workspace hoist borrowed by the nested repo.
+		await fs.mkdir(path.join(parent, "node_modules"), { recursive: true });
+		await fs.symlink(path.join(parent, "node_modules"), path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "stale-hoist"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// Not a shared symlink; the worktree owns its boundary directory.
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
+		// Simulate the pre-fix contaminated state: the worktree's node_modules is a
+		// symlink to the repo's (hoisted, outside-sourceRoot) node_modules.
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.symlink(path.join(repo, "node_modules"), worktreeModules);
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "stale-hoist"]);
+		expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
+		// The parent's own tree survives remediation.
+		expect((await fs.stat(path.join(parent, "node_modules"))).isDirectory()).toBe(true);
+	});
+
+	it("keeps the worktree resolving its own workspace sources beside a parent workspace hoist", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-resolve-hoist-"));
+		cleanupPaths.push(parent);
+		// Parent workspace with its own live (divergent) copy of the package.
+		await fs.mkdir(path.join(parent, "packages", "app", "src"), { recursive: true });
+		await Bun.write(
+			path.join(parent, "packages", "app", "package.json"),
+			'{"name":"@scope/app","exports":{".":"./src/index.ts"}}\n',
+		);
+		await Bun.write(
+			path.join(parent, "packages", "app", "src", "index.ts"),
+			'export const marker = "parent-live-source";\n',
+		);
+		await fs.mkdir(path.join(parent, "node_modules", "@scope"), { recursive: true });
+		await fs.symlink(path.join(parent, "packages", "app"), path.join(parent, "node_modules", "@scope", "app"));
+		// Nested repo inside that parent, with its own workspace member.
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(path.join(repo, "packages", "app", "src"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }),
+		);
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			'{"name":"@scope/app","exports":{".":"./src/index.ts"}}\n',
+		);
+		await Bun.write(
+			path.join(repo, "packages", "app", "src", "index.ts"),
+			'export const marker = "worktree-own-source";\n',
+		);
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// The nested repo borrows the parent's tree — the exact #4620 shape.
+		await fs.symlink(path.join(parent, "node_modules"), path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "resolve-hoist"]);
+		// The worktree is a sibling of repo inside parent, so the parent's
+		// node_modules is an ancestor module root. Module resolution inside the
+		// worktree must still bind to the worktree's own commit, not the parent's
+		// live sources.
+		const probe = Bun.spawnSync(["bun", "-e", 'import { marker } from "@scope/app"; process.stdout.write(marker)'], {
+			cwd: launched.cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(probe.stderr.toString()).toBe("");
+		expect(probe.stdout.toString().trim()).toBe("worktree-own-source");
+	});
+
+	it("refuses the launch for a user-owned external node_modules link that cannot be resolved", async () => {
+		const repo = await createRepo("gjc-launch-worktree-unresolvable-link-");
+		const external = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-external-store-"));
+		cleanupPaths.push(external);
+		await fs.mkdir(path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "unresolvable-link"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.symlink(path.join(external, "store"), worktreeModules, "dir");
+
+		// Identity resolution fails only for permission reasons: the link target is
+		// a user-owned external store, not the source checkout. The launcher must
+		// refuse the launch rather than delete user data or continue through the
+		// unproven boundary. A persistent target-aware spy delegates to the real
+		// implementation for unrelated paths (the first reuse call resolves
+		// sourceRoot) and asserts the target path was reached.
+		const realRealpath = fsSync.realpathSync.bind(fsSync);
+		let reachedTarget = false;
+		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementation(((pathArg: fsSync.PathLike) => {
+			if (path.resolve(String(pathArg)) === path.resolve(worktreeModules)) {
+				reachedTarget = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realRealpath(pathArg);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "unresolvable-link"])).toThrow(
+				/worktree_node_modules_unverified/,
+			);
+			expect(reachedTarget).toBe(true);
+			// The user-owned external link is preserved untouched.
+			expect(await fs.readlink(worktreeModules)).toBe(path.join(external, "store"));
+		} finally {
+			realpathSpy.mockRestore();
+		}
+	});
+
+	it("refuses a reused boundary when workspace members change", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-reconcile-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "reconcile"]);
+		const modules = path.join(first.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Remove the member from the worktree tree (as a new commit would).
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true, force: true });
+		// Add a different member.
+		await fs.mkdir(path.join(first.cwd, "packages", "newapp"), { recursive: true });
+		await Bun.write(path.join(first.cwd, "packages", "newapp", "package.json"), '{"name":"@scope/newapp"}\n');
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "reconcile"])).toThrow(/worktree_boundary_stale_member/);
+		// The stale link is preserved rather than deleted through a path that could
+		// have been swapped to an outside symlink.
+		expect((await fs.lstat(path.join(modules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("builds the boundary from pnpm-workspace.yaml when package.json declares none", async () => {
+		const repo = await createRepo("gjc-launch-worktree-pnpm-decl-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(path.join(repo, "package.json"), JSON.stringify({ name: "root", private: true }));
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "pnpm workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "pnpm-decl"]);
+		const link = path.join(launched.cwd, "node_modules", "@scope", "app");
+		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(link)).toBe(path.join(launched.cwd, "packages", "app"));
+	});
+
+	it("builds the boundary from package.json workspace packages declarations", async () => {
+		const repo = await createRepo("gjc-launch-worktree-package-decl-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: { packages: ["packages/*"] } }),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "package workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "package-decl"]);
+		const link = path.join(launched.cwd, "node_modules", "@scope", "app");
+		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(link)).toBe(path.join(launched.cwd, "packages", "app"));
+	});
+
+	it("refuses traversal workspace patterns instead of writing outside the worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-traversal-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["../escape/*"] }),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "traversal pattern"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_pattern_invalid/);
+	});
+
+	it("refuses member package names outside the npm grammar", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-bad-name-");
+		await fs.mkdir(path.join(repo, "packages", "evil"), { recursive: true });
+		await Bun.write(path.join(repo, "packages", "evil", "package.json"), '{"name":"../escape"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "bad name"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_member_name_invalid/);
+	});
+
+	it("refuses malformed member manifests instead of skipping them", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-bad-member-");
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), "{ not json");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "bad member"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_member_invalid/);
+	});
+
+	it("leaves a complete user-owned node_modules directory without the marker untouched", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-user-dir-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "user-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// Replace the launcher boundary with a user-owned install-like directory
+		// that still resolves every declared member (a copy of the member).
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "@scope", "app"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "@scope", "app", "index.js"), "// installed\n");
+		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "ms", "marker.txt"), "user-owned\n");
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "user-dir"]);
+		expect(await Bun.file(path.join(reused.cwd, "node_modules", "ms", "marker.txt")).text()).toBe("user-owned\n");
+		expect(await Bun.file(path.join(reused.cwd, "node_modules", "@scope", "app", "index.js")).text()).toBe(
+			"// installed\n",
+		);
+	});
+
+	it("refuses an incomplete user-owned node_modules directory in a workspace worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-incomplete-dir-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "incomplete-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// A partial tree: unrelated entries only, the declared member is absent,
+		// so it would resolve through an ancestor checkout.
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "ms", "marker.txt"), "user-owned\n");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "incomplete-dir"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
+		// Refused, not deleted: the user-owned content survives.
+		expect(await Bun.file(path.join(launched.cwd, "node_modules", "ms", "marker.txt")).text()).toBe("user-owned\n");
+	});
+
+	it("refuses a user-owned node_modules directory whose member entry resolves outside the worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-outside-dir-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-outside-member-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "outside-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "@scope"), { recursive: true });
+		await fs.symlink(outside, path.join(worktreeModules, "@scope", "app"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "outside-dir"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
+	});
+	it("refuses a member entry that loops back to the boundary directory itself", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-selfloop-dir-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "selfloop-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "@scope"), { recursive: true });
+		await fs.symlink(worktreeModules, path.join(worktreeModules, "@scope", "app"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "selfloop-dir"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
+	});
+
+	it("preserves package-manager-installed links inside a marker-owned boundary", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-pkg-replaced-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "pkg-replaced"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Simulate a package-manager install replacing the launcher's link with
+		// a real installed entry while the marker happens to survive. A real
+		// install materializes every workspace member; the unrelated `ms`
+		// entry proves the launcher did not prune it.
+		await fs.rm(path.join(worktreeModules, "@scope", "app"));
+		await fs.mkdir(path.join(worktreeModules, "@scope", "app"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "@scope", "app", "index.js"), "// installed\n");
+		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "ms", "index.js"), "// installed\n");
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "pkg-replaced"]);
+		const reusedModules = path.join(reused.cwd, "node_modules");
+		// The installed entry survives; the launcher does not manage the tree.
+		expect(await Bun.file(path.join(reusedModules, "ms", "index.js")).text()).toBe("// installed\n");
+	});
+
+	it("refuses a stale boundary after the workspace declaration disappears", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-decl-gone-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "decl-gone"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Drop the workspace declaration (workspace -> non-workspace transition).
+		await Bun.write(path.join(launched.cwd, "package.json"), '{"name":"root","private":true}\n');
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "decl-gone"])).toThrow(/worktree_boundary_stale_member/);
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+	});
+	it("never deletes a package-manager entry that replaced a recorded boundary link", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-replaced-recorded-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "replaced-recorded"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Replace only the recorded member link with a different identity while
+		// the marker and the ownership manifest (which still records the old
+		// target) survive — the launcher must not delete the replacement.
+		await fs.rm(path.join(worktreeModules, "@scope", "app"));
+		const replaced = path.join(launched.cwd, "vendor", "app-copy");
+		await fs.mkdir(replaced, { recursive: true });
+		await Bun.write(path.join(replaced, "index.js"), "// vendored\n");
+		await fs.symlink(replaced, path.join(worktreeModules, "@scope", "app"));
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "replaced-recorded"]);
+		const reusedModules = path.join(reused.cwd, "node_modules");
+		const link = path.join(reusedModules, "@scope", "app");
+		// The replacement is preserved untouched; the launcher dropped its
+		// stale claim instead of deleting the entry on the manifest's say-so.
+		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(link)).toBe(replaced);
+	});
+
+	it("fails closed on a malformed link-ownership manifest", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-bad-manifest-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "bad-manifest"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+
+		await Bun.write(path.join(worktreeModules, ".gjc-node-modules-links.json"), "{ not json");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "bad-manifest"])).toThrow(
+			/worktree_boundary_manifest_invalid|worktree_boundary_auth_(missing|mismatch)/,
+		);
+	});
+
+	it("fails closed on a link-ownership manifest with traversal entry names", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-traversal-manifest-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "traversal-manifest"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+
+		// A crafted manifest key that would escape node_modules if joined.
+		await Bun.write(
+			path.join(worktreeModules, ".gjc-node-modules-links.json"),
+			JSON.stringify({ "../../outside": "/tmp/somewhere" }),
+		);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "traversal-manifest"])).toThrow(
+			/worktree_boundary_manifest_invalid|worktree_boundary_auth_(missing|mismatch)/,
+		);
+	});
+
+	it("rejects ownership metadata whose recorded target escapes the worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-forged-target-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-forged-target-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "forged-target"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		const linkPath = path.join(worktreeModules, "@scope", "app");
+		const linkBefore = await fs.realpath(linkPath);
+		await Bun.write(
+			path.join(worktreeModules, ".gjc-node-modules-links.json"),
+			JSON.stringify({ "@scope/app": outside }),
+		);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "forged-target"])).toThrow(
+			/worktree_boundary_manifest_invalid|worktree_boundary_auth_(missing|mismatch)/,
+		);
+		expect(await fs.realpath(linkPath)).toBe(linkBefore);
+		expect(await fs.readdir(outside)).toEqual([]);
+	});
+
+	it("fails closed on a non-object link-ownership manifest", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-array-manifest-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "array-manifest"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+
+		await Bun.write(path.join(worktreeModules, ".gjc-node-modules-links.json"), '["@scope/app"]');
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "array-manifest"])).toThrow(
+			/worktree_boundary_manifest_invalid|worktree_boundary_auth_(missing|mismatch)/,
+		);
+	});
+	it("never reads a link-ownership manifest that is a symlink to an external file", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-manifest-symlink-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-manifest-escape-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "manifest-symlink"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		const outsideTarget = path.join(outside, "secret.txt");
+		await Bun.write(outsideTarget, "do-not-touch\n");
+		await fs.rm(path.join(worktreeModules, ".gjc-node-modules-links.json"));
+		await fs.symlink(outsideTarget, path.join(worktreeModules, ".gjc-node-modules-links.json"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "manifest-symlink"])).toThrow(
+			/worktree_boundary_manifest_invalid/,
+		);
+		// The external target is never created or overwritten through the link.
+		expect(await Bun.file(outsideTarget).text()).toBe("do-not-touch\n");
+	});
+
+	it("fails closed on a dangling link-ownership manifest symlink", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-manifest-dangling-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "manifest-dangling"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(path.join(worktreeModules, ".gjc-node-modules-links.json"));
+		await fs.symlink(
+			path.join(os.tmpdir(), "gjc-no-such-manifest-target-xyz"),
+			path.join(worktreeModules, ".gjc-node-modules-links.json"),
+		);
+
+		// A dangling link must be treated as an obstruction, not "absent": the
+		// write below it would otherwise create the external target.
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "manifest-dangling"])).toThrow(
+			/worktree_boundary_manifest_invalid/,
+		);
+	});
+
+	it("never treats a symlinked boundary marker as launcher ownership", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-marker-symlink-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-marker-escape-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "marker-symlink"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		const outsideTarget = path.join(outside, "marker.txt");
+		await Bun.write(outsideTarget, "marker\n");
+		await fs.rm(path.join(worktreeModules, ".gjc-node-modules-boundary"));
+		await fs.symlink(outsideTarget, path.join(worktreeModules, ".gjc-node-modules-boundary"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "marker-symlink"])).toThrow(
+			/worktree_boundary_marker_invalid/,
+		);
+		expect(await Bun.file(outsideTarget).text()).toBe("marker\n");
+	});
+
+	it("excludes members matched by later negated pnpm workspace patterns", async () => {
+		const repo = await createRepo("gjc-launch-worktree-negation-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*", "!packages/legacy"] }),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "negated workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "negation"]);
+		const modules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app")).catch(() => null))?.isSymbolicLink()).toBe(true);
+		// The negated member is excluded: never linked, so it cannot shadow or
+		// be resolved as a workspace member.
+		expect(await fs.lstat(path.join(modules, "@scope", "legacy")).catch(() => null)).toBe(null);
+	});
+
+	it("reconciles a boundary when a member becomes excluded by a negated pattern", async () => {
+		const repo = await createRepo("gjc-launch-worktree-negation-reconcile-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+
+		const first = prepareLaunchWorktree(repo, ["--worktree", "negation-reconcile"]);
+		const modules = path.join(first.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "legacy"))).isSymbolicLink()).toBe(true);
+
+		// Exclude the member at a later commit.
+		await Bun.write(
+			path.join(first.cwd, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*", "!packages/legacy"] }),
+		);
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "negation-reconcile"])).toThrow(
+			/worktree_boundary_stale_member/,
+		);
+		expect((await fs.lstat(path.join(modules, "@scope", "legacy"))).isSymbolicLink()).toBe(true);
+	});
+	it("re-includes a member negated earlier when a later positive pattern matches it", async () => {
+		const repo = await createRepo("gjc-launch-worktree-reinclude-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({
+				name: "root",
+				private: true,
+				workspaces: ["packages/*", "!packages/legacy", "packages/legacy"],
+			}),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "re-inclusion"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "reinclude"]);
+		const modules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+		// Ordered semantics: the trailing positive pattern re-includes the member
+		// the negation removed, so it gets a local link instead of resolving
+		// through an ancestor.
+		expect((await fs.lstat(path.join(modules, "@scope", "legacy"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("refuses an external node_modules link that is not a complete boundary", async () => {
+		// Ancestor workspace whose install graph carries a source-linked member.
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-external-link-"));
+		cleanupPaths.push(parent);
+		const ancestorModules = path.join(parent, "node_modules");
+		await fs.mkdir(path.join(ancestorModules, "@scope"), { recursive: true });
+		await fs.symlink(path.join(parent, "live-app"), path.join(ancestorModules, "@scope", "app"));
+		await fs.mkdir(path.join(parent, "live-app"), { recursive: true });
+
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-external-link-repo-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "external-link"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.symlink(ancestorModules, worktreeModules);
+
+		// The ancestor tree does not resolve the worktree's own member (it
+		// points at the ancestor's live copy), so accepting it would bind the
+		// worktree to the ancestor's sources: refused.
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "external-link"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
+	});
+
+	it("refuses a non-directory node_modules entry in a workspace worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-file-obstruction-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "file-obstruction"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await Bun.write(worktreeModules, "not a directory\n");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "file-obstruction"])).toThrow(
+			/worktree_node_modules_not_a_boundary/,
+		);
+		// Refused, not deleted.
+		expect(await Bun.file(worktreeModules).text()).toBe("not a directory\n");
+	});
+	it("refuses a marker-owned boundary left incomplete by a damaged replacement", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-partial-reconcile-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "partial-reconcile"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Simulate the crash window of a non-atomic replacement: the member
+		// link is gone while the marker and ownership manifest survive.
+		await fs.rm(path.join(worktreeModules, "@scope", "app"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "partial-reconcile"])).toThrow(
+			/worktree_boundary_incomplete_after_reconcile/,
+		);
+	});
+	it("unions mixed declarations so a negation in one cannot exclude the other's member", async () => {
+		const repo = await createRepo("gjc-launch-worktree-mixed-decl-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*", "!packages/legacy"] }),
+		);
+		await Bun.write(path.join(repo, "pnpm-workspace.yaml"), "packages:\n  - 'packages/legacy'\n");
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "mixed declarations"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "mixed-decl"]);
+		const modules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+		// pnpm-workspace.yaml positively selects legacy, so package.json's
+		// negation must not leave it to ancestor resolution.
+		expect((await fs.lstat(path.join(modules, "@scope", "legacy"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("refuses a selected member without a package name instead of skipping it", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-nameless-member-");
+		await fs.mkdir(path.join(repo, "packages", "nameless"), { recursive: true });
+		await Bun.write(path.join(repo, "packages", "nameless", "package.json"), '{"private":true}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "nameless member"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_member_name_invalid/);
+	});
+
+	it("never traverses a source node_modules root symlinked outside the repo", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-root-symlink-"));
+		cleanupPaths.push(parent);
+		const externalStore = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-store-root-"));
+		cleanupPaths.push(externalStore);
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(repo, { recursive: true });
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		await Bun.write(path.join(repo, "README.md"), "hello\n");
+		run("git", ["add", "README.md"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// The source tree's node_modules points at an external install graph.
+		await fs.symlink(externalStore, path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
+	});
+
+	it("rejects symlinked parents that resolve outside the boundary", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-symlinked-parent-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-outside-checkout-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "symlinked-parent"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// An attacker-controlled @scope directory that is a symlink outside.
+		await fs.rm(path.join(worktreeModules, "@scope"), { recursive: true, force: true });
+		await fs.symlink(outside, path.join(worktreeModules, "@scope"));
+
+		// Reconciliation must refuse to create links through the symlinked parent
+		// instead of writing into the outside directory.
+		let message = "";
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "symlinked-parent"]);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toMatch(/worktree_workspace_link_outside|worktree_workspace_member_outside/);
+		// The outside sentinel directory was not populated.
+		expect(await fs.readdir(outside)).toEqual([]);
+	});
+	it("case-fold probe never deletes user entries at the former fixed probe names", async () => {
+		const repo = await createRepo("gjc-launch-worktree-case-probe-");
+		// A user-owned directory sitting exactly at the probe name the old
+		// implementation removed recursively before probing.
+		const sentinel = path.join(repo, ".gjc-case-probe-a");
+		await fs.mkdir(sentinel);
+		await Bun.write(path.join(sentinel, "keep.txt"), "keep\n");
+		// Force the identity scan (probeRoot = the checkout) with a self-link.
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "@scope"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(originModules, "@scope", "app"));
+
+		prepareLaunchWorktree(repo, ["--worktree", "case-probe"]);
+
+		// The sentinel survives untouched, and no probe residue remains.
+		expect(await fs.readFile(path.join(sentinel, "keep.txt"), "utf8")).toBe("keep\n");
+		const leftovers = (await fs.readdir(repo)).filter(entry => entry.startsWith(".gjc-case-probe"));
+		expect(leftovers).toEqual([".gjc-case-probe-a"]);
+	});
+
+	it("fails closed when the worktree root manifest cannot be lstat'd (non-ENOENT)", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-manifest-eacces-");
+		// An unreadable-at-lstat root manifest must not read as "absent": the old
+		// catch-all tryLstat routed this down the plain-repository sharing path.
+		const realLstat = fsSync.lstatSync.bind(fsSync) as unknown as (...args: unknown[]) => unknown;
+		let reachedManifest = false;
+		const lstatSpy = spyOn(fsSync, "lstatSync").mockImplementation(((pathArg: fsSync.PathLike) => {
+			const asString = String(pathArg);
+			if (asString.includes(".gajae-code-worktrees") && asString.endsWith("package.json")) {
+				reachedManifest = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realLstat(pathArg);
+		}) as unknown as typeof fsSync.lstatSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "manifest-eacces"])).toThrow(/permission denied/);
+			expect(reachedManifest).toBe(true);
+		} finally {
+			lstatSpy.mockRestore();
+		}
+	});
+
+	it("ignores installed dependency manifests matched by recursive workspace patterns", async () => {
+		const repo = await createRepo("gjc-launch-worktree-recursive-scan-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["**"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "recursive-scan"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await fs.realpath(path.join(worktreeModules, "@scope", "app"))).toBe(
+			path.join(launched.cwd, "packages", "app"),
+		);
+
+		// A later worktree-local install drops dependency manifests under
+		// node_modules — including ones without a package name. The recursive
+		// `**` pattern must not adopt them as workspace members (the old scan
+		// threw worktree_workspace_member_name_invalid here).
+		await fs.mkdir(path.join(worktreeModules, "fake-dep"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "fake-dep", "package.json"), '{"version":"1.0.0"}\n');
+		const relaunched = prepareLaunchWorktree(repo, ["--worktree", "recursive-scan"]);
+		expect(relaunched.worktree.enabled && relaunched.worktree.reused).toBe(true);
+		// The dependency was neither linked into ownership nor deleted.
+		expect((await fs.lstat(path.join(worktreeModules, "fake-dep"))).isDirectory()).toBe(true);
+		const ownership = JSON.parse(
+			(await fs.readFile(path.join(worktreeModules, ".gjc-node-modules-links.json"), "utf8"))
+				.split("\n")
+				.slice(2)
+				.join("\n"),
+		) as Record<string, string>;
+		expect(Object.keys(ownership)).toEqual(["@scope/app"]);
+	});
+
+	it("reclaims dead owners but never live owners", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-lock-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"]);
+		const lockPath = path.join(launched.cwd, ".gjc-node-modules-boundary.lock");
+		const ownerPath = path.join(lockPath, "owner-dead-holder.json");
+		// The holder released its lock.
+		await expectEntryState(lockPath, "missing");
+
+		// A dead owner belongs to a crashed launcher: it is reclaimed and launch
+		// proceeds without relying on synchronous timer callbacks.
+		await fs.mkdir(lockPath);
+		await Bun.write(ownerPath, JSON.stringify({ token: "dead-holder", pid: 999999 }));
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"]);
+		expect(reused.worktree.enabled && reused.worktree.reused).toBe(true);
+		await expectEntryState(lockPath, "missing");
+
+		// A live owner cannot be reclaimed merely because its filesystem timestamp
+		// is old; the protected operation is synchronous and has no heartbeat timer.
+		await fs.mkdir(lockPath);
+		await fs.rm(ownerPath, { force: true });
+		const liveOwnerPath = path.join(lockPath, "owner-live-holder.json");
+		await Bun.write(liveOwnerPath, JSON.stringify({ token: "live-holder", pid: process.pid }));
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"])).toThrow(
+				/worktree_boundary_lock_busy/,
+			);
+			// The live holder's own token is untouched by the failed contender.
+			expect(JSON.parse(await Bun.file(liveOwnerPath).text()).token).toBe("live-holder");
+		} finally {
+			await fs.rm(lockPath, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("does not reclaim malformed owner metadata until it is old", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-lock-steal-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "lock-steal"]);
+		const lockPath = path.join(launched.cwd, ".gjc-node-modules-boundary.lock");
+		const ownerPath = path.join(lockPath, "owner-malformed.json");
+
+		// A truncated owner record is preserved while the lock directory is fresh;
+		// release cannot remove a lock whose ownership it cannot prove.
+		await fs.mkdir(lockPath);
+		await Bun.write(ownerPath, '{"token":');
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "lock-steal"])).toThrow(/worktree_boundary_lock_busy/);
+		} finally {
+			await fs.rm(lockPath, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("does not remove a successor lock after stale-owner observation", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-lock-successor-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "lock-successor"]);
+		const lockPath = path.join(launched.cwd, ".gjc-node-modules-boundary.lock");
+		const ownerPath = path.join(lockPath, "owner-dead-holder.json");
+		await fs.mkdir(lockPath);
+		await Bun.write(ownerPath, JSON.stringify({ token: "dead-holder", pid: 999999 }));
+
+		const realUnlink = fsSync.unlinkSync.bind(fsSync);
+		let successorInstalled = false;
+		const unlinkSpy = spyOn(fsSync, "unlinkSync").mockImplementation(((target: fsSync.PathLike) => {
+			realUnlink(target);
+			if (path.resolve(String(target)) === path.resolve(ownerPath) && !successorInstalled) {
+				successorInstalled = true;
+				fsSync.writeFileSync(
+					path.join(lockPath, "owner-successor.json"),
+					JSON.stringify({ token: "successor", pid: process.pid }),
+				);
+			}
+		}) as typeof fsSync.unlinkSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "lock-successor"])).toThrow(
+				/worktree_boundary_lock_busy/,
+			);
+			expect(successorInstalled).toBe(true);
+			expect(JSON.parse(await Bun.file(path.join(lockPath, "owner-successor.json")).text()).token).toBe("successor");
+		} finally {
+			unlinkSpy.mockRestore();
+			await fs.rm(lockPath, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("fails closed when a registered worktree identity cannot be resolved", async () => {
+		const repo = await createRepo("gjc-launch-worktree-identity-eacces-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "identity-eacces"]);
+		const realRealpath = fsSync.realpathSync;
+		let reachedTarget = false;
+		const spy = spyOn(fsSync, "realpathSync").mockImplementation(((target: fsSync.PathLike) => {
+			if (path.resolve(String(target)) === path.resolve(first.cwd)) {
+				reachedTarget = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realRealpath(target as string);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "identity-eacces"])).toThrow(
+				/worktree_identity_unverified/,
+			);
+			expect(reachedTarget).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("recognizes an alias spelling of a live worktree as the same physical location", async () => {
+		// P1-2: with both sides resolvable, identity is physical — a symlink
+		// alias of the live worktree must be recognized as the same location so
+		// reuse and branch-in-use decisions cannot be dodged by spelling. This
+		// pins the non-lexical contract the review asked for: the comparison
+		// proves realpath identity instead of comparing spellings.
+		const repo = await createRepo("gjc-launch-worktree-alias-live-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "alias-live"]);
+		const bucketRoot = path.dirname(first.cwd);
+		const aliasLink = path.join(bucketRoot, "alias-link");
+		await fs.symlink(first.cwd, aliasLink, "dir");
+		cleanupPaths.push(aliasLink);
+
+		// The alias resolves to the live worktree: reuse through the canonical
+		// plan must still be recognized (both spellings prove one identity).
+		const reused = ensureLaunchWorktree({
+			...planLaunchWorktree(repo, { enabled: true, detached: false, name: "alias-live" }),
+		} as Parameters<typeof ensureLaunchWorktree>[0]);
+		expect(reused.enabled && reused.reused).toBe(true);
+		expect(await fs.realpath(aliasLink)).toBe(await fs.realpath(first.cwd));
+	});
+
+	it("decides one-resolvable/one-absent as different locations without lexical fallback", async () => {
+		// P1-2 residual: when exactly one side resolves, the comparison is
+		// physical and provable — different locations. Pin this branch so a
+		// regression back to path.resolve() equality (which could equate an
+		// absent alias spelling with a live path) fails this test.
+		const repo = await createRepo("gjc-launch-worktree-alias-half-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "alias-half"]);
+		const alias = `${first.cwd}-alias`;
+		expect(fsSync.existsSync(alias)).toBe(false);
+
+		// Register a second git worktree at a REAL path, then swap its directory
+		// to a dangling symlink so its registered path resolves nowhere while
+		// the primary worktree resolves: exactly the one-absent case.
+		const holder = prepareLaunchWorktree(repo, ["--worktree", "alias-holder"]);
+		const holderPath = holder.cwd;
+		await fs.rm(holderPath, { recursive: true, force: true });
+		await fs.symlink(path.join(path.dirname(holderPath), "does-not-exist"), holderPath, "dir");
+
+		// Launching the primary plan again must not be confused by the absent
+		// holder: it must reuse cleanly (registered entry still matches its
+		// branch) rather than mis-deciding identity through lexical fallback.
+		const reused = ensureLaunchWorktree({
+			...planLaunchWorktree(repo, { enabled: true, detached: false, name: "alias-half" }),
+		} as Parameters<typeof ensureLaunchWorktree>[0]);
+		expect(reused.enabled && reused.reused).toBe(true);
+	});
+
+	it("fails closed when one side of a worktree comparison is unreadable (EACCES)", async () => {
+		// P1-2: non-broken realpath errors must never reach a lexical fallback.
+		// One unreadable side means the comparison is unprovable: refuse with
+		// worktree_identity_unverified instead of deciding by spelling.
+		const repo = await createRepo("gjc-launch-worktree-alias-eacces-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "alias-eacces"]);
+		const realRealpath = fsSync.realpathSync;
+		let reachedComparison = false;
+		const spy = spyOn(fsSync, "realpathSync").mockImplementation(((target: fsSync.PathLike) => {
+			// Fail identity resolution only for the REGISTERED worktree path
+			// (the side ensureLaunchWorktree actually compares).
+			if (path.resolve(String(target)) === path.resolve(first.cwd)) {
+				reachedComparison = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realRealpath(target as string);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			expect(() =>
+				ensureLaunchWorktree({
+					...planLaunchWorktree(repo, { enabled: true, detached: false, name: "alias-eacces" }),
+				} as Parameters<typeof ensureLaunchWorktree>[0]),
+			).toThrow(/worktree_identity_unverified/);
+			expect(reachedComparison).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("preserves a valid member link whose realpath is merely unreadable (EACCES)", async () => {
+		// tryRealpath's null means "resolves nowhere" and drives deletion. An
+		// EACCES/EIO must never be collapsed into that, or a perfectly valid link
+		// is destroyed on a permissions change or a network-mount hiccup.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-eacces-keep-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "eacces-keep"]);
+		const linkPath = path.join(first.cwd, "node_modules", "@scope", "app");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+
+		// Drop the member so reconciliation considers the recorded link stale,
+		// and make exactly that link's realpath fail with EACCES.
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true });
+		const realRealpath = fsSync.realpathSync;
+		const spy = spyOn(fsSync, "realpathSync").mockImplementation(((p: fsSync.PathLike) => {
+			if (String(p) === linkPath) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			return realRealpath(p as string);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			try {
+				prepareLaunchWorktree(repo, ["--worktree", "eacces-keep"]);
+			} catch {
+				// Propagation is an acceptable outcome; silent deletion is not.
+			}
+		} finally {
+			spy.mockRestore();
+		}
+		const survived = await fs.lstat(linkPath).then(
+			s => s.isSymbolicLink(),
+			() => false,
+		);
+		expect(survived).toBe(true);
+	});
+
+	it("does not treat an unreadable source node_modules as absent", async () => {
+		// existsSync answers false for EACCES as well as ENOENT; taking the
+		// "no origin tree" branch there would build a boundary as though the
+		// source carried no install at all.
+		const repo = await createRepo("gjc-launch-worktree-src-eacces-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "leftpad"), { recursive: true });
+		const realLstat = fsSync.lstatSync;
+		const spy = spyOn(fsSync, "lstatSync").mockImplementation(((p: fsSync.PathLike, o?: unknown) => {
+			if (String(p) === originModules) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			return realLstat(p as string, o as never);
+		}) as unknown as typeof fsSync.lstatSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "src-eacces"])).toThrow(/permission denied|EACCES/);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("refuses a launcher link missing from the manifest under an existing marker", async () => {
+		// A crash between installing a link and committing the manifest leaves a
+		// marker-owned boundary holding an unrecorded link. Location under the
+		// marker is not proof that GJC installed it, so recovery refuses rather than
+		// adopting a package-manager or user-owned replacement. The manifest is
+		// re-signed with the worktree's own key so this test exercises the
+		// unowned-member path, not the auth mismatch.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-adopt-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "adopt"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const manifestContents = `${JSON.stringify({}, null, "\t")}\n`;
+		const gitDir = run("git", ["rev-parse", "--absolute-git-dir"], first.cwd);
+		const key = await fs.readFile(path.join(gitDir, "gjc-node-modules-boundary.key"));
+		const digest = crypto.createHmac("sha256", key).update(manifestContents, "utf8").digest("hex");
+		await Bun.write(
+			path.join(modules, ".gjc-node-modules-links.json"),
+			`gajae.boundary-ownership.v1\nsha256:${digest}\n${manifestContents}`,
+		);
+		// Point the link somewhere stale so a correction is observable.
+		const linkPath = path.join(modules, "@scope", "app");
+		await fs.rm(linkPath);
+		await fs.symlink(path.join(first.cwd, "packages"), linkPath, "dir");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "adopt"])).toThrow(/worktree_boundary_unowned_member/);
+		expect(await fs.realpath(linkPath)).toBe(path.join(first.cwd, "packages"));
+	});
+
+	it("discovers a declared workspace member reached through a directory symlink", async () => {
+		// Bun.Glob does not follow symlinks by default, so a declared member that
+		// is a directory symlink vanished from discovery, leaving an empty member
+		// set that still passed completeness -- isolation silently absent.
+		const repo = await createRepo("gjc-launch-worktree-symlink-member-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "real", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "real", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages"), { recursive: true });
+		await fs.symlink(path.join(repo, "real", "app"), path.join(repo, "packages", "app"), "dir");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "symlinked member"], repo);
+
+		// The member must be discovered: either linked into the boundary, or the
+		// launch refuses. A silent empty member set presenting as success is the
+		// failure this pins.
+		let refused = false;
+		let launchedCwd = "";
+		try {
+			launchedCwd = prepareLaunchWorktree(repo, ["--worktree", "symlink-member"]).cwd;
+		} catch {
+			refused = true;
+		}
+		const discovered =
+			refused ||
+			(await fs.lstat(path.join(launchedCwd, "node_modules", "@scope", "app")).then(
+				() => true,
+				() => false,
+			));
+		expect(discovered).toBe(true);
+	});
+
+	it("reuses an unchanged member link instead of replacing it", async () => {
+		// Recreating an unchanged junction is destruction that buys nothing, and
+		// Windows rejects the replacement while the junction is in use. A reuse
+		// launch must perform no symlink write for an already-correct link.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-unchanged-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "unchanged"]);
+		const linkPath = path.join(first.cwd, "node_modules", "@scope", "app");
+		expect(await fs.realpath(linkPath)).toBe(path.join(first.cwd, "packages", "app"));
+
+		const spy = spyOn(fsSync, "symlinkSync");
+		try {
+			const reused = prepareLaunchWorktree(repo, ["--worktree", "unchanged"]);
+			expect(reused.worktree.enabled && reused.worktree.reused).toBe(true);
+			const rewroteMember = spy.mock.calls.some(call => String(call[1]).includes("@scope"));
+			expect(rewroteMember).toBe(false);
+		} finally {
+			spy.mockRestore();
+		}
+		expect(await fs.realpath(linkPath)).toBe(path.join(first.cwd, "packages", "app"));
+	});
+
+	it("never deletes through a boundary parent swapped to an outside symlink", async () => {
+		// Identity is proven against the recorded target, but the PARENT chain can
+		// be swapped afterwards; without a containment re-proof immediately before
+		// the delete, rmSync lands outside the worktree.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-escape-del-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "escape-del"]);
+		const modules = path.join(first.cwd, "node_modules");
+
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-outside-scope-"));
+		cleanupPaths.push(outside);
+		await Bun.write(path.join(outside, "app", "keep.txt"), "must survive\n");
+
+		// Make the member stale so reconciliation wants to delete @scope/app,
+		// then swap the @scope parent to resolve outside the worktree.
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true });
+		await fs.rm(path.join(modules, "@scope"), { recursive: true, force: true });
+		await fs.symlink(outside, path.join(modules, "@scope"), "dir");
+
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "escape-del"]);
+		} catch {
+			// Refusing is fine; deleting outside the boundary is not.
+		}
+		expect(await Bun.file(path.join(outside, "app", "keep.txt")).text()).toBe("must survive\n");
+	});
+
+	it("rejects a symlinked workspace link parent even when it stays inside the boundary", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-parent-invalid-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "parent-invalid"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const parentPath = path.join(modules, "@scope");
+		const internalTarget = path.join(modules, "internal-scope");
+		await fs.mkdir(internalTarget);
+		await fs.rm(parentPath, { recursive: true, force: true });
+		await fs.symlink(internalTarget, parentPath, "dir");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "parent-invalid"])).toThrow(
+			/worktree_workspace_link_parent_invalid/,
+		);
+	});
+
+	it("refuses a workspace link parent whose canonical identity escapes the boundary", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-parent-outside-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "parent-outside"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const parentPath = path.join(modules, "@scope");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-parent-outside-"));
+		cleanupPaths.push(outside);
+
+		const realRealpath = fsSync.realpathSync;
+		let parentRealpathCalls = 0;
+		const spy = spyOn(fsSync, "realpathSync").mockImplementation(((target: fsSync.PathLike) => {
+			if (String(target) === parentPath) {
+				parentRealpathCalls += 1;
+				return parentRealpathCalls === 1 ? realRealpath(target as string) : outside;
+			}
+			return realRealpath(target as string);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "parent-outside"])).toThrow(
+				/worktree_workspace_link_parent_outside/,
+			);
+			expect(parentRealpathCalls).toBeGreaterThanOrEqual(2);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("fails closed when the scoped parent is replaced after validation", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-parent-swap-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "parent-swap"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const parentPath = path.join(modules, "@scope");
+		const linkPath = path.join(parentPath, "app");
+		await fs.rm(linkPath);
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-parent-swap-outside-"));
+		cleanupPaths.push(outside);
+		await Bun.write(path.join(outside, "sentinel.txt"), "preserve\n");
+		const displaced = path.join(modules, ".gjc-displaced-scope");
+		const realRealpath = fsSync.realpathSync;
+		let parentReads = 0;
+		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementation(((target: fsSync.PathLike) => {
+			const result = realRealpath(target as string);
+			if (String(target) === parentPath) {
+				parentReads += 1;
+				if (parentReads === 3) {
+					fsSync.renameSync(parentPath, displaced);
+					fsSync.symlinkSync(outside, parentPath, "dir");
+				}
+			}
+			return result;
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "parent-swap"])).toThrow(
+				/worktree_workspace_link_parent_(replaced|invalid|outside)|worktree_boundary_incomplete_after_reconcile/,
+			);
+		} finally {
+			realpathSpy.mockRestore();
+		}
+		expect(parentReads).toBeGreaterThanOrEqual(3);
+		expect(await Bun.file(path.join(outside, "sentinel.txt")).text()).toBe("preserve\n");
+	});
+
+	it("rejects a member manifest that is valid JSON but not an object", async () => {
+		const repo = await createRepo("gjc-launch-worktree-null-member-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), "null");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "null member"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "null-member"])).toThrow(
+			/worktree_workspace_member_invalid/,
+		);
+	});
+	it("refuses ownership-map reuse across A→B→A member changes", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-aba-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "aba-reuse"]);
+		const worktreeModules = path.join(first.cwd, "node_modules");
+		expect(await fs.realpath(path.join(worktreeModules, "@scope", "app"))).toBe(
+			path.join(first.cwd, "packages", "app"),
+		);
+
+		// State B: replace @scope/app with @scope/lib on the worktree's own
+		// branch. The stale A link is preserved and the launch fails closed rather
+		// than inferring ownership from the marker directory.
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(first.cwd, "packages", "lib"), { recursive: true });
+		await Bun.write(
+			path.join(first.cwd, "packages", "lib", "package.json"),
+			JSON.stringify({ name: "@scope/lib", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "packages"], first.cwd);
+		run("git", ["commit", "-m", "swap app for lib"], first.cwd);
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "aba-reuse"])).toThrow(/worktree_boundary_stale_member/);
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("commits boundary metadata atomically without temporary-file residue", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-metadata-commit-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "metadata-commit"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// Reconcile again so both the manifest rewrite and marker path run.
+		prepareLaunchWorktree(repo, ["--worktree", "metadata-commit"]);
+		const entries = await fs.readdir(worktreeModules);
+		expect(entries.filter(entry => entry.includes(".gjc-new-"))).toEqual([]);
+		const ownership = JSON.parse(
+			(await fs.readFile(path.join(worktreeModules, ".gjc-node-modules-links.json"), "utf8"))
+				.split("\n")
+				.slice(2)
+				.join("\n"),
+		) as Record<string, string>;
+		expect(Object.keys(ownership)).toEqual(["@scope/app"]);
+		expect(entries).toContain(".gjc-node-modules-boundary");
+	});
+});
+
+describe("boundary ownership authentication (#4626 review: forged ownership metadata)", () => {
+	async function createWorkspaceRepoForAuth(prefix: string): Promise<string> {
+		const repo = await createRepo(prefix);
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+		return repo;
+	}
+
+	/** Re-writes the manifest as an envelope whose digest the forger cannot compute. */
+	async function forgeManifest(modules: string, record: Record<string, string>): Promise<void> {
+		// The forger can produce a well-formed envelope with a digest over the
+		// bytes — but not under the launcher's key, which never lives inside
+		// node_modules. Any digest they can compute will not verify.
+		const contents = `${JSON.stringify(record, null, "\t")}\n`;
+		const forgedDigest = crypto.createHash("sha256").update(contents).digest("hex");
+		await Bun.write(
+			path.join(modules, ".gjc-node-modules-links.json"),
+			`gajae.boundary-ownership.v1\nsha256:${forgedDigest}\n${contents}`,
+		);
+	}
+
+	it("refuses a forged manifest that points a recorded name at another in-worktree link", async () => {
+		// P1-1: an edited manifest (valid JSON, in-worktree target) used to
+		// authorize replacing a user-owned link at that name. The digest must
+		// fail the whole reconciliation before any replacement happens.
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-forged-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "forged"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const linkPath = path.join(modules, "@scope", "app");
+
+		// User replaces the launcher's link with their own vendored copy.
+		const vendored = path.join(first.cwd, "vendor", "app-copy");
+		await fs.mkdir(vendored, { recursive: true });
+		await Bun.write(path.join(vendored, "index.js"), "// vendored\n");
+		await fs.rm(linkPath);
+		await fs.symlink(vendored, linkPath, "dir");
+
+		// Forger rewrites the manifest to "prove" launcher ownership of the
+		// vendored link (in-worktree target, valid package grammar) so the next
+		// launch would replace it with the launcher's own member link.
+		await forgeManifest(modules, { "@scope/app": vendored });
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "forged"])).toThrow(/worktree_boundary_auth_mismatch/);
+		// The user-owned replacement is preserved byte-for-byte.
+		expect(await fs.readlink(linkPath)).toBe(vendored);
+		expect(await Bun.file(path.join(vendored, "index.js")).text()).toBe("// vendored\n");
+	});
+
+	it("refuses an unauthenticated manifest record (no envelope) under an existing marker", async () => {
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-missing-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "auth-missing"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const linkPath = path.join(modules, "@scope", "app");
+		const linkBefore = await fs.readlink(linkPath);
+
+		// Strip the envelope: a bare record with no header/digest must not be
+		// trusted, exactly like a manifest whose digest was never written.
+		await Bun.write(path.join(modules, ".gjc-node-modules-links.json"), JSON.stringify({}, null, "\t"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "auth-missing"])).toThrow(
+			/worktree_boundary_auth_missing/,
+		);
+		expect(await fs.readlink(linkPath)).toBe(linkBefore);
+	});
+
+	it("keeps a crash between envelope write and legacy cleanup recoverable", async () => {
+		// The envelope is ONE rename, so an interrupted commit cannot split the
+		// record from its digest. Simulate the leftover from the superseded
+		// split-pair scheme: a stale digest file beside a valid envelope must
+		// not block reconciliation.
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-crash-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "auth-crash"]);
+		const modules = path.join(first.cwd, "node_modules");
+		await Bun.write(path.join(modules, ".gjc-node-modules-links.auth"), "deadbeef\n");
+
+		const second = prepareLaunchWorktree(repo, ["--worktree", "auth-crash"]);
+		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
+		// The stale digest file is removed on commit.
+		expect(
+			await fs.lstat(path.join(modules, ".gjc-node-modules-links.auth")).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+
+	it("refuses an envelope transplanted from a different worktree", async () => {
+		// Keys are per-worktree: one worktree's valid envelope must not verify
+		// against this worktree's key, even transplanted wholesale.
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-foreign-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "auth-foreign"]);
+		const donorRepo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-donor-");
+		const donor = prepareLaunchWorktree(donorRepo, ["--worktree", "auth-donor"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const donorModules = path.join(donor.cwd, "node_modules");
+		const linkPath = path.join(modules, "@scope", "app");
+		const linkBefore = await fs.readlink(linkPath);
+
+		// Transplant the donor's VALID envelope (header + correct digest over
+		// the donor's own bytes, signed under the donor's key).
+		const donorEnvelope = await Bun.file(path.join(donorModules, ".gjc-node-modules-links.json")).text();
+		await Bun.write(path.join(modules, ".gjc-node-modules-links.json"), donorEnvelope);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "auth-foreign"])).toThrow(
+			/worktree_boundary_auth_mismatch/,
+		);
+		expect(await fs.readlink(linkPath)).toBe(linkBefore);
+	});
+
+	it("never stores the authentication key inside node_modules", async () => {
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-keyloc-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "auth-keyloc"]);
+		const modules = path.join(first.cwd, "node_modules");
+
+		// The key must live outside node_modules (in the worktree's private git
+		// dir), so a package manager rewriting node_modules cannot rewrite it.
+		const entries = await fs.readdir(modules);
+		expect(entries.some(entry => entry.includes("boundary.key"))).toBe(false);
+		const gitDir = run("git", ["rev-parse", "--absolute-git-dir"], first.cwd);
+		expect(await Bun.file(path.join(gitDir, "gjc-node-modules-boundary.key")).exists()).toBe(true);
+	});
+
+	it("round-trips an authenticated manifest across reuse launches", async () => {
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-roundtrip-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "auth-roundtrip"]);
+		const modules = path.join(first.cwd, "node_modules");
+
+		// A legitimate reuse must still reconcile cleanly with auth in place.
+		const second = prepareLaunchWorktree(repo, ["--worktree", "auth-roundtrip"]);
+		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
+		expect(await fs.realpath(path.join(modules, "@scope", "app"))).toBe(path.join(first.cwd, "packages", "app"));
+		// The committed manifest is a single authenticated envelope.
+		const manifestText = await Bun.file(path.join(modules, ".gjc-node-modules-links.json")).text();
+		expect(manifestText.startsWith("gajae.boundary-ownership.v1\nsha256:")).toBe(true);
+		expect(
+			await fs.lstat(path.join(modules, ".gjc-node-modules-links.auth")).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+
+	it("refuses to publish a member link whose target was swapped outside before the write", async () => {
+		// Codex review (D): the member spelling is validated at scan time but
+		// the write happens later. A swap of packages/app to an outside symlink
+		// in between must refuse, not publish a boundary link out of the worktree.
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-member-swap-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "member-swap"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const linkPath = path.join(modules, "@scope", "app");
+
+		// Swap the declared member to an external directory AFTER the first
+		// launch recorded it, and remove the boundary link so the next launch
+		// republishes it.
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-member-swap-outside-"));
+		cleanupPaths.push(outside);
+		await Bun.write(path.join(outside, "sentinel.txt"), "preserve\n");
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true });
+		await fs.symlink(outside, path.join(first.cwd, "packages", "app"), "dir");
+		await fs.rm(linkPath);
+
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "member-swap"]);
+		} catch {
+			// Refusal is the required outcome.
+		}
+		// Whatever happened, no boundary entry resolves outside the worktree...
+		const entry = await fs
+			.lstat(linkPath)
+			.then(stat => (stat.isSymbolicLink() ? fs.realpath(linkPath) : null))
+			.catch(() => null);
+		if (entry !== null) {
+			expect(entry.startsWith(`${first.cwd}${path.sep}`)).toBe(true);
+		}
+		// ...and the outside tree is untouched.
+		expect(await Bun.file(path.join(outside, "sentinel.txt")).text()).toBe("preserve\n");
+	});
+
+	it("treats an unauthenticated manifest without a private git dir as unavailable, not trusted", async () => {
+		// A layout where no private git dir exists (key cannot be persisted)
+		// must refuse to trust an existing manifest rather than reading it raw.
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-nodir-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "auth-nodir"]);
+		const gitDir = run("git", ["rev-parse", "--absolute-git-dir"], first.cwd);
+		const keyPath = path.join(gitDir, "gjc-node-modules-boundary.key");
+
+		// Simulate the unavailable-key layout by removing the persisted key
+		// while the manifest and digest remain.
+		await fs.rm(keyPath);
+		// Ensure loadOrCreateBoundaryAuthKey cannot recreate it: make the
+		// private dir read-only for this process.
+		await fs.chmod(gitDir, 0o500);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "auth-nodir"])).toThrow(
+				/worktree_boundary_auth_(unavailable|missing|key_invalid|key_unwritable)/,
+			);
+		} finally {
+			await fs.chmod(gitDir, 0o700);
+		}
+	});
+	it("keeps the manifest envelope consistent under concurrent reconciliation", async () => {
+		// REAL concurrency: two separate processes reconcile the same worktree
+		// at once. The boundary lock serializes them; whichever loses must wait
+		// or fail busy — but the committed envelope must always verify, because
+		// record and digest land in one file through one rename.
+		const repo = await createWorkspaceRepoForAuth("gjc-launch-worktree-auth-concurrent-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "auth-concurrent"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const modulePath = path.resolve(import.meta.dir, "../../src/gjc-runtime/launch-worktree.ts");
+		const script = `
+import { prepareLaunchWorktree } from ${JSON.stringify(modulePath)};
+prepareLaunchWorktree(${JSON.stringify(repo)}, ["--worktree", "auth-concurrent"]);
+`;
+		const scriptPath = path.join(first.cwd, ".gjc-concurrent-probe.ts");
+		await Bun.write(scriptPath, script);
+		try {
+			const children = [
+				Bun.spawn(["bun", "run", scriptPath], { stdout: "ignore", stderr: "pipe" }),
+				Bun.spawn(["bun", "run", scriptPath], { stdout: "ignore", stderr: "pipe" }),
+			];
+			const exits = await Promise.all(children.map(child => child.exited));
+			// Both must exit cleanly, or a loser must surface the typed busy
+			// refusal — never a crash, and never a corrupted envelope.
+			for (const [index, code] of exits.entries()) {
+				if (code !== 0) {
+					const stderr = await new Response(children[index].stderr).text();
+					expect(stderr).toMatch(/worktree_boundary_lock_busy/);
+				}
+			}
+		} finally {
+			await fs.rm(scriptPath, { force: true });
+		}
+
+		// The committed envelope verifies: a follow-up launch reconciles cleanly.
+		const final = prepareLaunchWorktree(repo, ["--worktree", "auth-concurrent"]);
+		expect(final.worktree.enabled && final.worktree.reused).toBe(true);
+		const manifestText = await Bun.file(path.join(modules, ".gjc-node-modules-links.json")).text();
+		expect(manifestText.startsWith("gajae.boundary-ownership.v1\nsha256:")).toBe(true);
+		const entries = await fs.readdir(modules);
+		expect(entries.filter(entry => entry.includes(".gjc-new-"))).toEqual([]);
+	}, 30_000);
+});
+
+describe("no-clobber publication (#4626 review: destination replaced mid-publication)", () => {
+	it("refuses to replace a destination entry created between validation and publication", async () => {
+		const repo = await createRepo("gjc-launch-worktree-clobber-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+
+		const first = prepareLaunchWorktree(repo, ["--worktree", "clobber"]);
+		const modules = path.join(first.cwd, "node_modules");
+		const linkPath = path.join(modules, "@scope", "app");
+		await fs.rm(linkPath);
+		// Force republication: re-sign the manifest as an empty record so the member
+		// loop republishes every member link this launch.
+		const gitDir = run("git", ["rev-parse", "--absolute-git-dir"], first.cwd);
+		const key = await fs.readFile(path.join(gitDir, "gjc-node-modules-boundary.key"));
+		const emptyRecord = `${JSON.stringify({}, null, "\t")}\n`;
+		const digest = crypto.createHmac("sha256", key).update(emptyRecord, "utf8").digest("hex");
+		await Bun.write(
+			path.join(modules, ".gjc-node-modules-links.json"),
+			`gajae.boundary-ownership.v1\nsha256:${digest}\n${emptyRecord}`,
+		);
+		const userDir = path.join(first.cwd, "vendor", "user-pkg");
+		await fs.mkdir(userDir, { recursive: true });
+		await Bun.write(path.join(userDir, "keep.txt"), "user data\n");
+
+		// A concurrent actor lands its entry at the destination in the last instant
+		// before publication, modeled by injecting at the temp-link creation (the
+		// last launcher-controlled moment before link()).
+		const realSymlink = fsSync.symlinkSync;
+		let injected = false;
+		const spy = spyOn(fsSync, "symlinkSync").mockImplementation(((
+			target: fsSync.PathLike,
+			destPath: fsSync.PathLike,
+			type?: fsSync.symlink.Type | null,
+		) => {
+			const dest = String(destPath);
+			if (!injected && dest.includes(".gjc-new-") && dest.includes("@scope")) {
+				injected = true;
+				fsSync.symlinkSync(userDir, dest.replace(/\.gjc-new-[^/]+$/, ""), "dir");
+			}
+			return realSymlink(target, destPath, type);
+		}) as typeof fsSync.symlinkSync);
+		let refusal = "";
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "clobber"]);
+		} catch (error) {
+			refusal = String(error);
+		} finally {
+			spy.mockRestore();
+		}
+		// The refusal must be the typed no-clobber error, not any failure.
+		expect(refusal).toMatch(/worktree_boundary_destination_replaced/);
+
+		// The user entry must survive untouched, and the publication must refuse.
+		const resolved = await fs.realpath(linkPath);
+		expect(resolved).toBe(await fs.realpath(userDir));
+		expect(await Bun.file(path.join(userDir, "keep.txt")).text()).toBe("user data\n");
+		expect(injected).toBe(true);
+		// No temp residue left behind by the refused publication.
+		const residue = (await fs.readdir(path.join(modules, "@scope"))).filter(entry => entry.includes(".gjc-new-"));
+		expect(residue).toEqual([]);
+	}, 20_000);
 });
 
 describe("GJC_WORKTREE_DIR path red-team", () => {
