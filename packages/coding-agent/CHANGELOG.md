@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Standalone GitHub release binaries now publish `gajae-release-binaries-v1.json` and `gajae-release-binaries.sha256` so installers and `gjc update` can verify downloads.
+
 ### Changed
 
+- End-user install and `gjc update` are standalone-binary-first and do not require Bun. `scripts/install.sh` / `install.ps1` default to the current platform GitHub release (stable, `--channel nightly`, or `--ref <tag>`), never detect or download Bun, and keep `--source` as an explicit development path that requires an already-installed Bun. `gjc update` resolves channels from GitHub releases, atomically replaces a matching binary, migrates package-manager shims to a user binary path instead of overwriting them, and refuses to self-overwrite source checkouts or `dev:link` executables.
 - The five `macOS Local (oMLX)` presets are retuned from same-machine throughput measurements (#4871). All presets now use one role-effort ladder — critic and architect `high`, planner `medium`, executor and default `low` — and pick each preset's model by measured local throughput: `fast` keeps the 4-bit and `balanced` the 8-bit Qwen 3.6 35B A3B MoE quants (93.5 / 71.1 tok/s measured), `quality` keeps the 8-bit MoE for default/executor/planner/architect and routes only the critic to the official dense `Qwen3.8-27B-8bit` checkpoint (public SWE-bench/agent scores still favor dense for criticism), and both `abliterated` presets move to the faster `Qwen3.8-27B-Uncensored-MLX-4bit` (19.8 tok/s measured, ahead of the Abliterated 4-bit/6-bit quants on every measured axis). Preset display names now state the measured throughput instead of the memory-tier hints.
 
 ### Fixed
