@@ -1052,11 +1052,13 @@ export async function reapDeadLifecycleMarkers(
 	limit = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
 ): Promise<number> {
 	let directory: string;
+	let directoryIdentity: { dev: bigint; ino: bigint };
 	try {
 		const canonicalRoot = fsSync.realpathSync(root);
 		directory = path.join(canonicalRoot, "sdk");
 		const directoryStat = fsSync.lstatSync(directory, { bigint: true });
 		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return 0;
+		directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
 	} catch {
 		return 0;
 	}
@@ -1089,12 +1091,12 @@ export async function reapDeadLifecycleMarkers(
 			}
 		}
 		try {
-			const currentPrimary = captureLifecycleFile(markerPath, true, true)?.identity;
+			const currentPrimary = captureLifecycleFile(markerPath, true, true);
 			const currentReady = ready ? captureLifecycleFile(readyPath, true, true)?.identity : undefined;
 			if (
 				!currentPrimary ||
 				!sameLifecycleCleanupIdentity(
-					currentPrimary,
+					currentPrimary.identity,
 					serializeCleanupIdentity({ ...primary.identity, size: Number(primary.identity.size) }),
 				) ||
 				(ready &&
@@ -1105,10 +1107,14 @@ export async function reapDeadLifecycleMarkers(
 						)))
 			)
 				continue;
+			const currentMarker = parseLifecycleJson(currentPrimary.bytes);
+			if (!isExactEffectMarker(currentMarker) || !sameEffectMarker(currentMarker, marker)) continue;
 			if (
 				ready &&
 				!nativeLifecycle().exactUnlinkDirect(readyPath, {
 					...ready.identity,
+					parentDev: directoryIdentity.dev,
+					parentIno: directoryIdentity.ino,
 					quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
 				}).ok
 			)
@@ -1116,6 +1122,8 @@ export async function reapDeadLifecycleMarkers(
 			if (
 				!nativeLifecycle().exactUnlinkDirect(markerPath, {
 					...primary.identity,
+					parentDev: directoryIdentity.dev,
+					parentIno: directoryIdentity.ino,
 					quarantineName: `.gjc-reap-${randomUUID()}-${name}`,
 				}).ok
 			)
@@ -4194,12 +4202,14 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
-			let childSpawnError: Error | undefined;
-			spawned.once("error", error => {
-				childSpawnError = error;
+			const spawnOutcome = Promise.withResolvers<void>();
+			spawned.once("error", error => spawnOutcome.reject(error));
+			spawned.once("spawn", () => spawnOutcome.resolve());
+			queueMicrotask(() => {
+				if (spawned.pid) spawnOutcome.resolve();
 			});
+			await spawnOutcome.promise;
 			const pid = spawned.pid;
-			if (childSpawnError) throw childSpawnError;
 			if (!pid) throw new Error("spawned session has no pid");
 			const incarnation = processIncarnationForBroker(broker, pid);
 			if (!incarnation) throw new Error("spawned session has no readable OS incarnation");
