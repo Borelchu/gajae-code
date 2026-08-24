@@ -1091,6 +1091,13 @@ export async function reapDeadLifecycleMarkers(
 			}
 		}
 		try {
+			const currentParent = lifecycleParentIdentity(directory);
+			if (
+				!currentParent ||
+				BigInt(currentParent.dev) !== directoryIdentity.dev ||
+				BigInt(currentParent.ino) !== directoryIdentity.ino
+			)
+				continue;
 			const currentPrimary = captureLifecycleFile(markerPath, true, true);
 			const currentReady = ready ? captureLifecycleFile(readyPath, true, true)?.identity : undefined;
 			if (
@@ -1113,8 +1120,6 @@ export async function reapDeadLifecycleMarkers(
 				ready &&
 				!nativeLifecycle().exactUnlinkDirect(readyPath, {
 					...ready.identity,
-					parentDev: directoryIdentity.dev,
-					parentIno: directoryIdentity.ino,
 					quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
 				}).ok
 			)
@@ -1122,8 +1127,6 @@ export async function reapDeadLifecycleMarkers(
 			if (
 				!nativeLifecycle().exactUnlinkDirect(markerPath, {
 					...primary.identity,
-					parentDev: directoryIdentity.dev,
-					parentIno: directoryIdentity.ino,
 					quarantineName: `.gjc-reap-${randomUUID()}-${name}`,
 				}).ok
 			)
